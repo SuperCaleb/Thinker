@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""
+Thinker – An AI system for predicting vehicle collisions from dashcam videos.
+Enhanced to be omnipotent with advanced feature extraction, Transformer-based sequence modeling,
+and robust data augmentation for real-world challenges.
+"""
+import asyncio
+import numpy as np
+import cv2
+import os
+import json
+import time
+import datetime
+import sys
+import signal
+import logging
+import logging.handlers
+from pathlib import Path
+from collections import deque
+from threading import Lock, Thread
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+import tensorflow as tf
+from tensorflow.keras.applications import EfficientNetB3
+from tensorflow.keras.applications.efficientnet import preprocess_input
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import (
+    Input, Dense, Concatenate, GlobalAveragePooling2D, GlobalAveragePooling1D,
+    Dropout, Layer, MultiHeadAttention, LayerNormalization
+)
+from tensorflow.keras.optimizers import Adam
+
+# Enable mixed precision if GPU is available
+if tf.config.list_physical_devices('GPU'):
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# --- Prometheus Monitoring Setup ---
+from prometheus_client import start_http_server, Gauge
+
+PROM_VIDEO_COUNT = Gauge('thinker_video_count', 'Number of videos being processed')
+PROM_AVG_COLLISION_PROB = Gauge('thinker_avg_collision_prob', 'Average collision probability across videos')
+PROM_ALERT = Gauge('thinker_alert_level', 'Overall alert level for collision predictions')
+
+def start_prometheus_server(port: int = 8000) -> None:
+    start_http_server(port)
+    STATE.logger.log_event("INFO", f"Prometheus metrics server started on port {port}")
+
+def update_prometheus_gauges(video_count: int, avg_prob: float) -> None:
+    PROM_VIDEO_COUNT.set(video_count)
+    PROM_AVG_COLLISION_PROB.set(avg_prob * 100)
+    PROM_ALERT.set(1 if avg_prob > CONFIG.alert_threshold else 0)
+
+# --- Configuration Management ---
+@dataclass
+class ThinkerConfig:
+    log_file: str = "thinker.log"
+    log_max_bytes: int = 10 * 1024 * 1024  # 10MB
+    log_backup_count: int = 5
+    log_metrics_interval: float = 300.0  # 5 minutes
+    model_weights_dir: str = "thinker_weights"
+    backup_dir: str = "thinker_backups"
+    alert_threshold: float = 0.7
+    near_collision_threshold: float = 0.7
+    collision_threshold: float = 0.9
+    sequence_length: int = 32
+    fps: int = 10
+    time_window: float = 5.0
+    learning_rate: float = 0.0001
+    batch_size: int = 8
+    check_interval: float = 1.0
+    health_check_interval: float = 30.0
+    email_smtp: str = "smtp.gmail.com"
+    email_port: int = 587
+    email_from: str = "thinker.alerts@gmail.com"
+    email_to: str = "driver@example.com"
+    email_password: str = os.getenv("THINKER_EMAIL_PASSWORD", "")
+    slack_webhook: Optional[str] = os.getenv("SLACK_WEBHOOK", None)
+    use_attention: bool = True
+    num_attention_heads: int = 4
+    data_augmentation: bool = True
+    augmentation_params: Dict[str, float] = None
+
+CONFIG = ThinkerConfig()
+CONFIG.augmentation_params = {
+    "rotation_range": 10,
+    "width_shift_range": 0.1,
+    "height_shift_range": 0.1,
+    "shear_range": 0.1,
+    "zoom_range": 0.1,
+    "horizontal_flip": True,
+    "brightness_range": (0.8, 1.2)
+}
+
+# --- Enhanced Logging System ---
+class ThinkerLogger:
+    def __init__(self, config):
+        self.config = config
+        self.logger = self._setup_logger()
+        self.log_metrics = {
+            "info_count": 0,
+            "warning_count": 0,
+            "error_count": 0,
+            "critical_count": 0,
+            "last_alert_time": 0.0
+        }
+        self.lock = Lock()
+        self.alert_queue = deque(maxlen=100)
+
+    def _setup_logger(self):
+        logger = logging.getLogger("Thinker")
+        logger.setLevel(logging.INFO)
+        rfh = logging.handlers.RotatingFileHandler(
+            filename=self.config.log_file,
+            maxBytes=self.config.log_max_bytes,
+            backupCount=self.config.log_backup_count
+        )
+        class StructuredFormatter(logging.Formatter):
+            def format(self, record):
+                log_dict = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "level": record.levelname,
+                    "message": record.msg % (record.args if record.args else ()),
+                    "module": record.module,
+                    "line": record.lineno,
+                    "process": record.process,
+                    "thread": record.threadName,
+                }
+                if hasattr(record, 'extra'):
+                    log_dict.update(record.extra)
+                return json.dumps(log_dict)
+        rfh.setFormatter(StructuredFormatter())
+        logger.handlers.clear()
+        logger.addHandler(rfh)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        logger.addHandler(ch)
+        return logger
+
+    def log_event(self, level, message, extra=None):
+        with self.lock:
+            extra = extra or {}
+            getattr(self.logger, level.lower())(message, extra=extra)
+            self._update_metrics(level)
+            self._check_alert_threshold(level, message)
+
+    def _update_metrics(self, level):
+        level_map = {
+            "INFO": "info_count",
+            "WARNING": "warning_count",
+            "ERROR": "error_count",
+            "CRITICAL": "critical_count"
+        }
+        if level in level_map:
+            self.log_metrics[level_map[level]] += 1
+
+    def _check_alert_threshold(self, level, message):
+        current_time = time.time()
+        if level in ("WARNING", "ERROR", "CRITICAL"):
+            self.alert_queue.append((current_time, level, message))
+            severe_recent = sum(
+                1 for t, lvl, _ in self.alert_queue
+                if lvl in ("WARNING", "ERROR", "CRITICAL") and current_time - t < 60
+            )
+            if severe_recent > 10:
+                self.logger.warning(f"High rate of severe logs detected: {severe_recent}")
+
+    async def report_metrics(self):
+        while STATE.active:
+            with self.lock:
+                self.logger.info(
+                    "Logging metrics report",
+                    extra={"metrics": self.log_metrics.copy(), "alert_queue_size": len(self.alert_queue)}
+                )
+            await asyncio.sleep(self.config.log_metrics_interval)
+
+# --- Global State Management ---
+class SystemState:
+    def __init__(self):
+        self.active = True
+        self.logger = ThinkerLogger(CONFIG)
+        self.process_hash = self._compute_process_hash()
+        self.video_history = deque(maxlen=1000)
+
+    def _compute_process_hash(self):
+        import hashlib
+        return hashlib.sha256(str(os.getpid()).encode()).hexdigest()
+
+STATE = SystemState()
+
+# --- Transformer Encoder Definition ---
+class TransformerEncoder(Layer):
+    def __init__(self, num_heads, d_model, ff_dim, dropout=0.1, **kwargs):
+        super(TransformerEncoder, self).__init__(**kwargs)
+        self.attention = MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads)
+        self.ffn = Sequential([
+            Dense(ff_dim, activation='relu'),
+            Dense(d_model)
+        ])
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+
+    def call(self, inputs, training=False):
+        attn_output = self.attention(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+# --- Thinker AI Core ---
+class Thinker:
+    def __init__(self):
+        """Initialize Thinker with an enhanced two-stream network using EfficientNetB3 and Transformers."""
+        self.config = CONFIG
+        self.logger = STATE.logger.logger
+
+        # Spatial CNN with EfficientNetB3
+        self.spatial_cnn = Sequential([
+            EfficientNetB3(weights='imagenet', include_top=False, input_shape=(300, 300, 3)),
+            GlobalAveragePooling2D()
+        ])
+        for layer in self.spatial_cnn.layers[0].layers[-10:]:
+            layer.trainable = True
+
+        # Temporal CNN with EfficientNetB3
+        self.temporal_cnn = Sequential([
+            EfficientNetB3(weights='imagenet', include_top=False, input_shape=(300, 300, 3)),
+            GlobalAveragePooling2D()
+        ])
+        for layer in self.temporal_cnn.layers[0].layers[-10:]:
+            layer.trainable = True
+
+        # Main prediction model with Transformer
+        self.model = self._build_model()
+        self.model.compile(
+            optimizer=Adam(learning_rate=self.config.learning_rate),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+
+        Path(self.config.model_weights_dir).mkdir(exist_ok=True)
+        Path(self.config.backup_dir).mkdir(exist_ok=True)
+
+        self.load_weights()
+        self.frame_pool = ThreadPoolExecutor(max_workers=4)
+
+    def _build_model(self):
+        """Build the two-stream Transformer model."""
+        spatial_input = Input(shape=(self.config.sequence_length, 1536))  # EfficientNetB3 output size
+        temporal_input = Input(shape=(self.config.sequence_length - 1, 1536))
+
+        spatial_transformed = TransformerEncoder(num_heads=8, d_model=1536, ff_dim=2048)(spatial_input)
+        temporal_transformed = TransformerEncoder(num_heads=8, d_model=1536, ff_dim=2048)(temporal_input)
+
+        spatial_pooled = GlobalAveragePooling1D()(spatial_transformed)
+        temporal_pooled = GlobalAveragePooling1D()(temporal_transformed)
+
+        combined = Concatenate()([spatial_pooled, temporal_pooled])
+        dense = Dense(128, activation='relu')(combined)
+        dropout = Dropout(0.5)(dense)
+        output = Dense(1, activation='sigmoid', dtype='float32')(dropout)
+        return Model(inputs=[spatial_input, temporal_input], outputs=output)
+
+    def load_weights(self):
+        """Load model weights if available."""
+        weights_path = Path(self.config.model_weights_dir) / "thinker.weights.h5"
+        if weights_path.exists():
+            try:
+                self.model.load_weights(str(weights_path))
+                self.logger.info(f"Loaded model weights from {weights_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to load weights: {str(e)}. Starting fresh.")
+        else:
+            self.logger.info(f"No weights at {weights_path}. Starting with fresh weights.")
+
+    def save_weights(self):
+        """Save model weights with backup."""
+        weights_path = Path(self.config.model_weights_dir) / "thinker.weights.h5"
+        backup_path = Path(self.config.backup_dir) / f"thinker_backup_{int(time.time())}.weights.h5"
+        try:
+            self.model.save_weights(str(weights_path))
+            self.model.save_weights(str(backup_path))
+            self.logger.info(f"Saved weights to {weights_path} and backup {backup_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save weights: {str(e)}")
+
+    def compute_optical_flow(self, prev_frame, next_frame):
+        """Compute optical flow between two frames."""
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+        next_gray = cv2.cvtColor(next_frame, cv2.COLOR_RGB2GRAY)
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            try:
+                gpu_prev = cv2.cuda_GpuMat()
+                gpu_next = cv2.cuda_GpuMat()
+                gpu_prev.upload(prev_gray)
+                gpu_next.upload(next_gray)
+                farneback = cv2.cuda_FarnebackOpticalFlow_create(5, 0.5, False, 15, 3, 5, 1.2, 0)
+                gpu_flow = farneback.calc(gpu_prev, gpu_next, None)
+                flow = gpu_flow.download()
+            except Exception as e:
+                self.logger.warning(f"CUDA optical flow failed: {str(e)}. Using CPU.")
+                flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        else:
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        flow = (flow + 20) / 40 * 255
+        flow = np.clip(flow, 0, 255).astype(np.float32)
+        return flow
+
+    def load_video_frames(self, video_path, apply_augmentation=True):
+        """Load and preprocess video frames with consistent augmentation."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            self.logger.error(f"Failed to open video: {video_path}")
+            return []
+        frame_rate = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = max(1, int(frame_rate / self.config.fps))
+        frames = []
+        frame_count = 0
+
+        if apply_augmentation and self.config.data_augmentation:
+            rotation = np.random.uniform(-self.config.augmentation_params["rotation_range"],
+                                         self.config.augmentation_params["rotation_range"])
+            tx = np.random.uniform(-self.config.augmentation_params["width_shift_range"] * 300,
+                                   self.config.augmentation_params["width_shift_range"] * 300)
+            ty = np.random.uniform(-self.config.augmentation_params["height_shift_range"] * 300,
+                                   self.config.augmentation_params["height_shift_range"] * 300)
+            brightness = np.random.uniform(*self.config.augmentation_params["brightness_range"])
+            flip = np.random.rand() < 0.5 if self.config.augmentation_params["horizontal_flip"] else False
+            apply_fog = np.random.rand() < 0.2
+        else:
+            rotation, tx, ty, brightness, flip, apply_fog = 0, 0, 0, 1, False, False
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_count % frame_interval == 0:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (300, 300)).astype(np.float32)
+                if rotation != 0 or tx != 0 or ty != 0:
+                    M = cv2.getRotationMatrix2D((150, 150), rotation, 1)
+                    M[0, 2] += tx
+                    M[1, 2] += ty
+                    frame = cv2.warpAffine(frame, M, (300, 300), borderMode=cv2.BORDER_REFLECT_101)
+                frame = frame * brightness
+                if flip:
+                    frame = cv2.flip(frame, 1)
+                if apply_fog:
+                    noise = np.random.normal(0, 25, frame.shape).astype(np.float32)
+                    frame = frame + noise
+                frame = np.clip(frame, 0, 255)
+                frames.append(frame)
+            frame_count += 1
+        cap.release()
+        self.logger.info(f"Loaded {len(frames)} frames from {video_path}")
+        return frames
+
+    def extract_features(self, frames):
+        """Extract spatial and temporal features from video frames."""
+        if len(frames) < self.config.sequence_length:
+            self.logger.warning(f"Video has fewer than {self.config.sequence_length} frames")
+            return None, None
+        frames_array = np.array(frames)
+        frames_array = preprocess_input(frames_array)
+        spatial_features = self.spatial_cnn.predict(frames_array, batch_size=32, verbose=0)
+        flows = []
+        for i in range(len(frames) - 1):
+            flow = self.compute_optical_flow(frames[i], frames[i + 1])
+            flow_3ch = np.stack([flow[:, :, 0], flow[:, :, 1], np.zeros_like(flow[:, :, 0])], axis=-1)
+            flows.append(flow_3ch)
+        flows_array = np.array(flows)
+        flows_array = preprocess_input(flows_array)
+        temporal_features = self.temporal_cnn.predict(flows_array, batch_size=32, verbose=0)
+        return spatial_features, temporal_features
+
+    def create_sequences(self, spatial_features, temporal_features):
+        """Create sequences for prediction."""
+        if spatial_features is None or len(spatial_features) < self.config.sequence_length:
+            return None, None
+        sequences_spatial = []
+        sequences_temporal = []
+        for i in range(self.config.sequence_length - 1, len(spatial_features)):
+            spatial_seq = spatial_features[i - self.config.sequence_length + 1:i + 1]
+            temporal_seq = temporal_features[i - self.config.sequence_length + 1:i]
+            sequences_spatial.append(spatial_seq)
+            sequences_temporal.append(temporal_seq)
+        return np.array(sequences_spatial), np.array(sequences_temporal)
+
+    def predict_on_video(self, video_path):
+        """Predict collision probabilities and classify event details."""
+        frames = self.load_video_frames(video_path, apply_augmentation=False)
+        if not frames or len(frames) < self.config.sequence_length:
+            self.logger.warning(f"Insufficient frames for prediction in {video_path}")
+            return {"predictions": [], "event_type": "normal", "event_time": None, "alert_time": None}
+
+        spatial_features, temporal_features = self.extract_features(frames)
+        if spatial_features is None:
+            return {"predictions": [], "event_type": "normal", "event_time": None, "alert_time": None}
+
+        sequences_spatial, sequences_temporal = self.create_sequences(spatial_features, temporal_features)
+        if sequences_spatial is None:
+            return {"predictions": [], "event_type": "normal", "event_time": None, "alert_time": None}
+
+        predictions = self.model.predict(
+            [sequences_spatial, sequences_temporal],
+            batch_size=self.config.batch_size,
+            verbose=0
+        )
+        padded_predictions = np.zeros(len(frames))
+        padded_predictions[self.config.sequence_length - 1:] = predictions.flatten()
+
+        max_prob = np.max(padded_predictions)
+        if max_prob > self.config.collision_threshold:
+            event_type = "collision"
+        elif np.any(padded_predictions > self.config.near_collision_threshold):
+            event_type = "near-collision"
+        else:
+            event_type = "normal"
+
+        if event_type != "normal":
+            event_frame = np.argmax(padded_predictions)
+            event_time = event_frame / self.config.fps
+            alert_frame = next((i for i, p in enumerate(padded_predictions) if p > self.config.near_collision_threshold), None)
+            alert_time = alert_frame / self.config.fps if alert_frame is not None else None
+        else:
+            event_time = None
+            alert_time = None
+
+        avg_prob = np.mean(padded_predictions)
+        update_prometheus_gauges(1, avg_prob)
+        self.logger.info(f"Average collision probability for {video_path}: {avg_prob:.4f}")
+
+        return {
+            "predictions": padded_predictions.tolist(),
+            "event_type": event_type,
+            "event_time": event_time,
+            "alert_time": alert_time
+        }
+
+    def train(self, video_paths, labels, epochs=10):
+        """Train the model with data generator."""
+        def data_generator():
+            while True:
+                batch_spatial = []
+                batch_temporal = []
+                batch_labels = []
+                for _ in range(self.config.batch_size):
+                    idx = np.random.randint(0, len(video_paths))
+                    video_path = video_paths[idx]
+                    label_dict = labels.get(video_path, {})
+                    collision_frame = label_dict.get("collision_frame", -1)
+                    frames = self.load_video_frames(video_path, apply_augmentation=True)
+                    if len(frames) < self.config.sequence_length:
+                        continue
+                    spatial_features, temporal_features = self.extract_features(frames)
+                    if spatial_features is None:
+                        continue
+                    start = np.random.randint(0, len(spatial_features) - self.config.sequence_length + 1)
+                    spatial_seq = spatial_features[start:start + self.config.sequence_length]
+                    temporal_seq = temporal_features[start:start + self.config.sequence_length - 1]
+                    end_frame = start + self.config.sequence_length - 1
+                    label = 1 if (collision_frame != -1 and
+                                  end_frame < collision_frame <= end_frame + int(
+                                  self.config.time_window * self.config.fps)) else 0
+                    batch_spatial.append(spatial_seq)
+                    batch_temporal.append(temporal_seq)
+                    batch_labels.append(label)
+                yield (np.array(batch_spatial), np.array(batch_temporal)), np.array(batch_labels)
+
+        steps_per_epoch = max(1, len(video_paths) // self.config.batch_size)
+        dataset = tf.data.Dataset.from_generator(
+            data_generator,
+            output_signature=(
+                (tf.TensorSpec(shape=(None, self.config.sequence_length, 1536), dtype=tf.float32),
+                 tf.TensorSpec(shape=(None, self.config.sequence_length - 1, 1536), dtype=tf.float32)),
+                tf.TensorSpec(shape=(None,), dtype=tf.int32)
+            )
+        )
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+        callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                filepath=str(Path(self.config.model_weights_dir) / "thinker.weights.h5"),
+                save_weights_only=True,
+                monitor='loss',
+                mode='min',
+                save_best_only=True
+            ),
+            tf.keras.callbacks.EarlyStopping(monitor='loss', patience=3, restore_best_weights=True),
+            tf.keras.callbacks.TensorBoard(log_dir="logs/thinker", update_freq='epoch'),
+            tf.keras.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: self.save_weights()),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='loss', factor=0.5, patience=2, min_lr=1e-6)
+        ]
+        self.model.fit(
+            dataset,
+            steps_per_epoch=steps_per_epoch,
+            epochs=epochs,
+            callbacks=callbacks
+        )
+        self.logger.info(f"Training completed for {epochs} epochs")
+
+# --- Health Check ---
+async def health_check(thinker):
+    while STATE.active:
+        try:
+            dummy_spatial = np.random.rand(1, CONFIG.sequence_length, 1536).astype(np.float32)
+            dummy_temporal = np.random.rand(1, CONFIG.sequence_length - 1, 1536).astype(np.float32)
+            thinker.model.predict([dummy_spatial, dummy_temporal], verbose=0)
+            thinker.save_weights()
+            STATE.logger.log_event("INFO", "Health check completed")
+        except Exception as e:
+            STATE.logger.log_event("ERROR", f"Health check failed: {str(e)}")
+        await asyncio.sleep(CONFIG.health_check_interval)
+
+# --- Notification System ---
+import smtplib
+from email.message import EmailMessage
+import aiohttp
+
+def send_email(msg):
+    if not CONFIG.email_password:
+        STATE.logger.log_event("ERROR", "Email password not set.")
+        return
+    try:
+        with smtplib.SMTP(CONFIG.email_smtp, CONFIG.email_port) as s:
+            s.starttls()
+            s.login(CONFIG.email_from, CONFIG.email_password)
+            s.send_message(msg)
+        STATE.logger.log_event("INFO", "Email alert sent")
+    except Exception as e:
+        STATE.logger.log_event("ERROR", f"Email alert failed: {str(e)}")
+
+async def send_notification(event_type, probability, event_time, alert_time):
+    """Send detailed notification with event information."""
+    msg_content = f"Thinker alert: {event_type} detected! Probability: {probability:.4f}, Event time: {event_time:.2f}s, Alert time: {alert_time:.2f}s"
+    if CONFIG.slack_webhook:
+        async with aiohttp.ClientSession() as session:
+            payload = {"text": msg_content}
+            async with session.post(CONFIG.slack_webhook, json=payload) as resp:
+                STATE.logger.log_event(
+                    "INFO" if resp.status == 200 else "WARNING",
+                    f"Slack alert {'sent' if resp.status == 200 else 'failed'}",
+                    {"status": resp.status}
+                )
+    msg = EmailMessage()
+    msg.set_content(msg_content)
+    msg["Subject"] = "Thinker Collision Alert"
+    msg["From"] = CONFIG.email_from
+    msg["To"] = CONFIG.email_to
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, send_email, msg)
+
+# --- Core Control Logic ---
+async def thinker_core(thinker):
+    start_prometheus_server()
+    STATE.logger.log_event("INFO", "Thinker activated")
+    while STATE.active:
+        video_path = "nexar_data/videos/00003.mp4"  # Replace with actual video source
+        if os.path.exists(video_path):
+            result = thinker.predict_on_video(video_path)
+            if result:
+                predictions = result["predictions"]
+                event_type = result["event_type"]
+                event_time = result["event_time"]
+                alert_time = result["alert_time"]
+                max_prob = max(predictions) if predictions else 0
+                if max_prob > CONFIG.alert_threshold:
+                    await send_notification(event_type, max_prob, event_time, alert_time)
+                    STATE.logger.log_event(
+                        "WARNING",
+                        f"High collision probability detected: {max_prob:.4f}, Event type: {event_type}, Event time: {event_time:.2f}s, Alert time: {alert_time:.2f}s"
+                    )
+                else:
+                    STATE.logger.log_event(
+                        "INFO",
+                        f"Video processed: Event type: {event_type}, Max probability: {max_prob:.4f}"
+                    )
+                STATE.video_history.append((video_path, result))
+        await asyncio.sleep(CONFIG.check_interval)
+
+# --- Main Execution ---
+async def run_thinker():
+    thinker = Thinker()
+    await asyncio.gather(
+        thinker_core(thinker),
+        health_check(thinker),
+        STATE.logger.report_metrics()
+    )
+
+def signal_handler(sig, frame):
+    STATE.active = False
+    thinker = Thinker()
+    thinker.save_weights()
+    STATE.logger.log_event("INFO", "Thinker shutting down")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    STATE.logger.log_event("INFO", "Starting Thinker")
+    try:
+        asyncio.run(run_thinker())
+    except Exception as e:
+        STATE.logger.log_event("CRITICAL", f"Thinker crashed: {str(e)}")
+        sys.exit(1)
