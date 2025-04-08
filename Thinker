@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Thinker – An AI system for predicting vehicle collisions from dashcam videos.
-Enhanced to be omnipotent with advanced feature extraction, Transformer-based sequence modeling,
-and robust data augmentation for real-world challenges.
+Enhanced with Heimdall-inspired abilities and Paul Atreides-like prescience using
+YOLOv8 object detection, Deep SORT tracking, and TTC-based foresight.
 """
 import asyncio
 import numpy as np
@@ -32,6 +32,10 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 
+# New dependencies for YOLOv8 and Deep SORT
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
 # Enable mixed precision if GPU is available
 if tf.config.list_physical_devices('GPU'):
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
@@ -43,14 +47,17 @@ PROM_VIDEO_COUNT = Gauge('thinker_video_count', 'Number of videos being processe
 PROM_AVG_COLLISION_PROB = Gauge('thinker_avg_collision_prob', 'Average collision probability across videos')
 PROM_ALERT = Gauge('thinker_alert_level', 'Overall alert level for collision predictions')
 
+
 def start_prometheus_server(port: int = 8000) -> None:
     start_http_server(port)
     STATE.logger.log_event("INFO", f"Prometheus metrics server started on port {port}")
+
 
 def update_prometheus_gauges(video_count: int, avg_prob: float) -> None:
     PROM_VIDEO_COUNT.set(video_count)
     PROM_AVG_COLLISION_PROB.set(avg_prob * 100)
     PROM_ALERT.set(1 if avg_prob > CONFIG.alert_threshold else 0)
+
 
 # --- Configuration Management ---
 @dataclass
@@ -80,7 +87,10 @@ class ThinkerConfig:
     use_attention: bool = True
     num_attention_heads: int = 4
     data_augmentation: bool = True
+    object_detection_N: int = 5  # Max objects to track per frame
+    object_detection_num_classes: int = 80  # COCO classes (YOLOv8)
     augmentation_params: Dict[str, float] = None
+
 
 CONFIG = ThinkerConfig()
 CONFIG.augmentation_params = {
@@ -92,6 +102,7 @@ CONFIG.augmentation_params = {
     "horizontal_flip": True,
     "brightness_range": (0.8, 1.2)
 }
+
 
 # --- Enhanced Logging System ---
 class ThinkerLogger:
@@ -116,6 +127,7 @@ class ThinkerLogger:
             maxBytes=self.config.log_max_bytes,
             backupCount=self.config.log_backup_count
         )
+
         class StructuredFormatter(logging.Formatter):
             def format(self, record):
                 log_dict = {
@@ -130,6 +142,7 @@ class ThinkerLogger:
                 if hasattr(record, 'extra'):
                     log_dict.update(record.extra)
                 return json.dumps(log_dict)
+
         rfh.setFormatter(StructuredFormatter())
         logger.handlers.clear()
         logger.addHandler(rfh)
@@ -178,6 +191,7 @@ class ThinkerLogger:
                 )
             await asyncio.sleep(self.config.log_metrics_interval)
 
+
 # --- Global State Management ---
 class SystemState:
     def __init__(self):
@@ -190,7 +204,9 @@ class SystemState:
         import hashlib
         return hashlib.sha256(str(os.getpid()).encode()).hexdigest()
 
+
 STATE = SystemState()
+
 
 # --- Transformer Encoder Definition ---
 class TransformerEncoder(Layer):
@@ -214,10 +230,11 @@ class TransformerEncoder(Layer):
         ffn_output = self.dropout2(ffn_output, training=training)
         return self.layernorm2(out1 + ffn_output)
 
+
 # --- Thinker AI Core ---
 class Thinker:
     def __init__(self):
-        """Initialize Thinker with an enhanced two-stream network using EfficientNetB3 and Transformers."""
+        """Initialize Thinker with enhanced two-stream network and prescience-inspired abilities."""
         self.config = CONFIG
         self.logger = STATE.logger.logger
 
@@ -237,6 +254,16 @@ class Thinker:
         for layer in self.temporal_cnn.layers[0].layers[-10:]:
             layer.trainable = True
 
+        # Initialize YOLOv8 and Deep SORT
+        self.yolo_model = YOLO('yolov8n.pt')  # Nano version for efficiency; use 'yolov8x.pt' for max accuracy
+        self.tracker = DeepSort(max_age=5, n_init=3, nn_budget=100)
+
+        # Compute object feature size (YOLOv8 + Deep SORT features + TTC_est)
+        self.num_object_features = self.config.object_detection_N * (
+                self.config.object_detection_num_classes + 9
+        # class one-hot + bbox (4) + conf + velocity (2) + size_change + TTC_est
+        )
+
         # Main prediction model with Transformer
         self.model = self._build_model()
         self.model.compile(
@@ -252,12 +279,17 @@ class Thinker:
         self.frame_pool = ThreadPoolExecutor(max_workers=4)
 
     def _build_model(self):
-        """Build the two-stream Transformer model."""
-        spatial_input = Input(shape=(self.config.sequence_length, 1536))  # EfficientNetB3 output size
+        """Build the two-stream Transformer model with enhanced spatial input including TTC."""
+        spatial_input = Input(shape=(self.config.sequence_length, 1536 + self.num_object_features))
         temporal_input = Input(shape=(self.config.sequence_length - 1, 1536))
 
-        spatial_transformed = TransformerEncoder(num_heads=8, d_model=1536, ff_dim=2048)(spatial_input)
-        temporal_transformed = TransformerEncoder(num_heads=8, d_model=1536, ff_dim=2048)(temporal_input)
+        # Build the model with proper initialization
+        spatial_transformed = TransformerEncoder(
+            num_heads=8, d_model=1536 + self.num_object_features, ff_dim=2048
+        )(spatial_input)
+        temporal_transformed = TransformerEncoder(
+            num_heads=8, d_model=1536, ff_dim=2048
+        )(temporal_input)
 
         spatial_pooled = GlobalAveragePooling1D()(spatial_transformed)
         temporal_pooled = GlobalAveragePooling1D()(temporal_transformed)
@@ -266,7 +298,15 @@ class Thinker:
         dense = Dense(128, activation='relu')(combined)
         dropout = Dropout(0.5)(dense)
         output = Dense(1, activation='sigmoid', dtype='float32')(dropout)
-        return Model(inputs=[spatial_input, temporal_input], outputs=output)
+
+        model = Model(inputs=[spatial_input, temporal_input], outputs=output)
+
+        # Build model with dummy input to initialize weights
+        dummy_spatial = tf.zeros((1, self.config.sequence_length, 1536 + self.num_object_features))
+        dummy_temporal = tf.zeros((1, self.config.sequence_length - 1, 1536))
+        model([dummy_spatial, dummy_temporal])
+
+        return model
 
     def load_weights(self):
         """Load model weights if available."""
@@ -362,14 +402,114 @@ class Thinker:
         self.logger.info(f"Loaded {len(frames)} frames from {video_path}")
         return frames
 
+    def detect_objects(self, frame):
+        """Detect objects using YOLOv8."""
+        results = self.yolo_model(frame, verbose=False)[0]
+        detections = []
+        for box in results.boxes:
+            x, y, w, h = box.xywh[0].tolist()  # xywh format
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+            detections.append(((x - w / 2, y - h / 2, w, h), confidence, class_id))  # (bbox, conf, class)
+        return detections
+
     def extract_features(self, frames):
-        """Extract spatial and temporal features from video frames."""
+        """Extract enhanced spatial and temporal features with YOLOv8, Deep SORT, and TTC."""
         if len(frames) < self.config.sequence_length:
             self.logger.warning(f"Video has fewer than {self.config.sequence_length} frames")
             return None, None
+
+        # Object tracking with YOLOv8 and Deep SORT, including TTC_est
+        object_feats_list = []
+        num_classes = self.config.object_detection_num_classes
+        N = self.config.object_detection_N
+        feat_per_object = num_classes + 9  # class one-hot + bbox(4) + conf + velocity(2) + size_change + TTC_est
+        prev_tracks = {}
+        area_history = {}  # track_id -> deque of areas, max length 5
+        track_confidences = {}  # Store confidence scores
+
+        for frame_idx, frame in enumerate(frames):
+            detections = self.detect_objects(frame)
+            tracks = self.tracker.update_tracks(detections, frame=frame)
+            obj_feats = []
+            current_areas = {}
+
+            # Update track confidences
+            for track, (bbox, conf, cls) in zip(tracks, detections):
+                if track.is_confirmed():
+                    track_confidences[track.track_id] = conf
+
+            # Process tracks
+            sorted_tracks = sorted(
+                [t for t in tracks if t.is_confirmed()],
+                key=lambda x: track_confidences.get(x.track_id, 0),
+                reverse=True
+            )[:N]
+
+            for track in sorted_tracks:
+                track_id = track.track_id
+                bbox = track.to_tlwh()  # (x, y, w, h)
+                area = bbox[2] * bbox[3]  # width * height
+                current_areas[track_id] = area
+                confidence = track_confidences.get(track_id, 0.9)
+
+                # Compute TTC_est
+                if track_id in area_history and len(area_history[track_id]) >= 2:
+                    area_t = area
+                    area_t2 = area_history[track_id][-2]  # Two frames prior
+                    delta_area = (area_t - area_t2) / 2  # d_area/dt over 2 frames
+                    if delta_area > 0.01 * area_t:  # Threshold for significance
+                        ttc_est = -area_t / delta_area
+                        ttc_est = min(max(ttc_est, 0), 100)  # Clip to [0, 100] frames
+                    else:
+                        ttc_est = 100
+                else:
+                    ttc_est = 100  # Default for new or short tracks
+
+                # Existing motion features
+                if track_id in prev_tracks:
+                    prev_bbox = prev_tracks[track_id]
+                    velocity_x = bbox[0] - prev_bbox[0]
+                    velocity_y = bbox[1] - prev_bbox[1]
+                    prev_size = prev_bbox[2] * prev_bbox[3]
+                    curr_size = bbox[2] * bbox[3]
+                    size_change = (curr_size / prev_size) - 1 if prev_size > 0 else 0
+                else:
+                    velocity_x, velocity_y, size_change = 0.0, 0.0, 0.0
+                prev_tracks[track_id] = bbox.copy()
+
+                # Feature vector with TTC_est
+                class_id = track.det_class if track.det_class is not None else 0
+                class_onehot = [0] * num_classes
+                class_onehot[class_id] = 1
+                feat = class_onehot + bbox.tolist() + [confidence, velocity_x, velocity_y, size_change, ttc_est]
+                obj_feats.append(feat)
+
+            # Update area history
+            for track_id, area in current_areas.items():
+                if track_id not in area_history:
+                    area_history[track_id] = deque(maxlen=5)
+                area_history[track_id].append(area)
+            # Clean up old tracks
+            active_ids = {track.track_id for track in tracks if track.is_confirmed()}
+            area_history = {k: v for k, v in area_history.items() if k in active_ids}
+
+            # Pad or truncate to N objects
+            flat_feats = [item for sublist in obj_feats for item in sublist]
+            if len(obj_feats) < N:
+                padding = [0.0] * (N - len(obj_feats)) * feat_per_object
+                flat_feats.extend(padding)
+            object_feats_list.append(flat_feats[:N * feat_per_object])
+
+        object_feats_array = np.array(object_feats_list, dtype=np.float32)
+
+        # Spatial features
         frames_array = np.array(frames)
         frames_array = preprocess_input(frames_array)
         spatial_features = self.spatial_cnn.predict(frames_array, batch_size=32, verbose=0)
+        spatial_features = np.concatenate([spatial_features, object_feats_array], axis=1)
+
+        # Temporal features
         flows = []
         for i in range(len(frames) - 1):
             flow = self.compute_optical_flow(frames[i], frames[i + 1])
@@ -378,6 +518,7 @@ class Thinker:
         flows_array = np.array(flows)
         flows_array = preprocess_input(flows_array)
         temporal_features = self.temporal_cnn.predict(flows_array, batch_size=32, verbose=0)
+
         return spatial_features, temporal_features
 
     def create_sequences(self, spatial_features, temporal_features):
@@ -394,7 +535,7 @@ class Thinker:
         return np.array(sequences_spatial), np.array(sequences_temporal)
 
     def predict_on_video(self, video_path):
-        """Predict collision probabilities and classify event details."""
+        """Predict collision probabilities and classify event details with foresight."""
         frames = self.load_video_frames(video_path, apply_augmentation=False)
         if not frames or len(frames) < self.config.sequence_length:
             self.logger.warning(f"Insufficient frames for prediction in {video_path}")
@@ -427,7 +568,8 @@ class Thinker:
         if event_type != "normal":
             event_frame = np.argmax(padded_predictions)
             event_time = event_frame / self.config.fps
-            alert_frame = next((i for i, p in enumerate(padded_predictions) if p > self.config.near_collision_threshold), None)
+            alert_frame = next(
+                (i for i, p in enumerate(padded_predictions) if p > self.config.near_collision_threshold), None)
             alert_time = alert_frame / self.config.fps if alert_frame is not None else None
         else:
             event_time = None
@@ -446,6 +588,7 @@ class Thinker:
 
     def train(self, video_paths, labels, epochs=10):
         """Train the model with data generator."""
+
         def data_generator():
             while True:
                 batch_spatial = []
@@ -468,7 +611,7 @@ class Thinker:
                     end_frame = start + self.config.sequence_length - 1
                     label = 1 if (collision_frame != -1 and
                                   end_frame < collision_frame <= end_frame + int(
-                                  self.config.time_window * self.config.fps)) else 0
+                                self.config.time_window * self.config.fps)) else 0
                     batch_spatial.append(spatial_seq)
                     batch_temporal.append(temporal_seq)
                     batch_labels.append(label)
@@ -478,7 +621,8 @@ class Thinker:
         dataset = tf.data.Dataset.from_generator(
             data_generator,
             output_signature=(
-                (tf.TensorSpec(shape=(None, self.config.sequence_length, 1536), dtype=tf.float32),
+                (tf.TensorSpec(shape=(None, self.config.sequence_length, 1536 + self.num_object_features),
+                               dtype=tf.float32),
                  tf.TensorSpec(shape=(None, self.config.sequence_length - 1, 1536), dtype=tf.float32)),
                 tf.TensorSpec(shape=(None,), dtype=tf.int32)
             )
@@ -506,11 +650,13 @@ class Thinker:
         )
         self.logger.info(f"Training completed for {epochs} epochs")
 
+
 # --- Health Check ---
 async def health_check(thinker):
     while STATE.active:
         try:
-            dummy_spatial = np.random.rand(1, CONFIG.sequence_length, 1536).astype(np.float32)
+            dummy_spatial = np.random.rand(1, CONFIG.sequence_length, 1536 + thinker.num_object_features).astype(
+                np.float32)
             dummy_temporal = np.random.rand(1, CONFIG.sequence_length - 1, 1536).astype(np.float32)
             thinker.model.predict([dummy_spatial, dummy_temporal], verbose=0)
             thinker.save_weights()
@@ -519,10 +665,12 @@ async def health_check(thinker):
             STATE.logger.log_event("ERROR", f"Health check failed: {str(e)}")
         await asyncio.sleep(CONFIG.health_check_interval)
 
+
 # --- Notification System ---
 import smtplib
 from email.message import EmailMessage
 import aiohttp
+
 
 def send_email(msg):
     if not CONFIG.email_password:
@@ -536,6 +684,7 @@ def send_email(msg):
         STATE.logger.log_event("INFO", "Email alert sent")
     except Exception as e:
         STATE.logger.log_event("ERROR", f"Email alert failed: {str(e)}")
+
 
 async def send_notification(event_type, probability, event_time, alert_time):
     """Send detailed notification with event information."""
@@ -556,6 +705,7 @@ async def send_notification(event_type, probability, event_time, alert_time):
     msg["To"] = CONFIG.email_to
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, send_email, msg)
+
 
 # --- Core Control Logic ---
 async def thinker_core(thinker):
@@ -585,6 +735,7 @@ async def thinker_core(thinker):
                 STATE.video_history.append((video_path, result))
         await asyncio.sleep(CONFIG.check_interval)
 
+
 # --- Main Execution ---
 async def run_thinker():
     thinker = Thinker()
@@ -594,12 +745,14 @@ async def run_thinker():
         STATE.logger.report_metrics()
     )
 
+
 def signal_handler(sig, frame):
     STATE.active = False
     thinker = Thinker()
     thinker.save_weights()
     STATE.logger.log_event("INFO", "Thinker shutting down")
     sys.exit(0)
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
